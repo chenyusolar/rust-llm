@@ -1,0 +1,14 @@
+
+   _   _____  __  __ ____   ___  
+  | | |___ /|  \/  |  _ \ / _ \ 
+ _| |_ |_ \| |\/| | |_) | | | |
+|_   _/___/|_|  |_|____/|_| |_|
+  |_|                          
+
+rust-llm v0.1.0 - High-performance LLM inference engine
+================================================
+
+[INFO] Loading model from: "e:\\models\\qwen\\Qwen3.5-9B-Q4_K_M.gguf"
+[INFO] GPU enabled: true
+[INFO] Context size: 2048
+

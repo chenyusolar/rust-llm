@@ -1081,16 +1081,16 @@ impl ModelLoader {
         let version = u32::from_le_bytes(version_bytes);
         eprintln!("[DEBUG] GGUF version: {}", version);
 
-        // Read tensor_count from header
-        let mut tc_bytes = [0u8; 4];
+        // Read tensor_count from header (u64, not u32)
+        let mut tc_bytes = [0u8; 8];
         file.read_exact(&mut tc_bytes)?;
-        let tensor_count = u32::from_le_bytes(tc_bytes) as usize;
+        let tensor_count = u64::from_le_bytes(tc_bytes) as usize;
         eprintln!("[DEBUG] Tensor count from header: {}", tensor_count);
 
-        // Read metadata_count from header
-        let mut mc_bytes = [0u8; 4];
+        // Read metadata_count from header (u64, not u32)
+        let mut mc_bytes = [0u8; 8];
         file.read_exact(&mut mc_bytes)?;
-        let metadata_count = u32::from_le_bytes(mc_bytes) as usize;
+        let metadata_count = u64::from_le_bytes(mc_bytes) as usize;
         eprintln!("[DEBUG] Metadata count from header: {}", metadata_count);
 
         // Parse metadata
@@ -1136,36 +1136,21 @@ impl ModelLoader {
 
         eprintln!("[DEBUG] Metadata parsed, {} entries, starting tensor info at byte {}", metadata.len(), file.stream_position().unwrap_or(16));
 
-        // Read alignment after metadata
-        let alignment_pos = file.stream_position().unwrap_or(0);
-        let alignment = read_u32(&mut file).unwrap_or(32) as usize;
-        let pos_after_alignment = file.stream_position().unwrap_or(0);
-        eprintln!("[DEBUG] Alignment: {} at pos {}, now at {}", alignment, alignment_pos, pos_after_alignment);
+        // Get alignment from metadata if available, otherwise use default 32
+        let alignment = metadata.get("general.alignment")
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(32);
+        eprintln!("[DEBUG] Alignment: {}", alignment);
 
-        // GGUF alignment is typically 32 bytes - tensor data must be aligned
-        // But tensor INFO starts right after alignment field
-        let tensor_info_start = pos_after_alignment as usize;
+        let tensor_info_start = file.stream_position().unwrap_or(0) as usize;
+        eprintln!("[DEBUG] Tensor info starts at byte {}", tensor_info_start);
 
-        // The alignment field itself should be 4 bytes, so we're at byte 20
-        // But the actual tensor data starts at an aligned boundary
-        // Let's calculate where tensor data would start based on file size and estimates
-        let estimated_tensor_data_start = ((tensor_info_start + 20000 + alignment - 1) / alignment) * alignment;
-        eprintln!("[DEBUG] Tensor info starts at {}, estimated tensor data start (aligned): {}", tensor_info_start, estimated_tensor_data_start);
-
-        // Read bytes at both positions to understand the layout
+        // Debug: peek at bytes at tensor_info_start
         file.seek(SeekFrom::Start(tensor_info_start as u64))?;
-        let mut debug_bytes1 = [0u8; 32];
-        if let Ok(_) = file.read_exact(&mut debug_bytes1) {
-            eprintln!("[DEBUG] Bytes at tensor_info_start ({}): {:02X?}", tensor_info_start, debug_bytes1);
+        let mut debug_bytes = [0u8; 32];
+        if let Ok(_) = file.read_exact(&mut debug_bytes) {
+            eprintln!("[DEBUG] Bytes at tensor_info_start ({}): {:02X?}", tensor_info_start, debug_bytes);
         }
-
-        file.seek(SeekFrom::Start(estimated_tensor_data_start as u64))?;
-        let mut debug_bytes2 = [0u8; 32];
-        if let Ok(_) = file.read_exact(&mut debug_bytes2) {
-            eprintln!("[DEBUG] Bytes at estimated tensor_data_start ({}): {:02X?}", estimated_tensor_data_start, debug_bytes2);
-        }
-
-        // Seek back to tensor_info_start to start parsing
         file.seek(SeekFrom::Start(tensor_info_start as u64))?;
 
         let mut tensors_info = Vec::new();
@@ -1193,7 +1178,7 @@ impl ModelLoader {
             // - dimensions: n_dims * uint64
             // - dtype: uint32 (4 bytes)
             // - offset: uint64 (8 bytes)
-            let name_len = match read_u32(&mut file) {
+            let name_len = match read_u32_from_reader(&mut file) {
                 Ok(n) => n as usize,
                 Err(e) => {
                     eprintln!("[DEBUG] Tensor {}: failed to read name_len at pos {}: {}", i, file.stream_position().unwrap_or(0), e);
