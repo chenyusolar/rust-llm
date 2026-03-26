@@ -276,7 +276,10 @@ impl GpuKernel {
         #[cfg(feature = "gpu")]
         {
             tracing::info!("Initializing GPU compute with wgpu...");
+            // GPU 初始化将在首次使用时通过 init_wgpu() 完成
+            // 这里只标记 GPU 可用，实际初始化是异步的
             self.gpu_available = true;
+            tracing::info!("GPU support enabled (will initialize on first use)");
         }
         
         #[cfg(not(feature = "gpu"))]
@@ -284,6 +287,21 @@ impl GpuKernel {
             tracing::warn!("GPU support not enabled, running in CPU fallback mode");
         }
         
+        Ok(())
+    }
+
+    /// 确保 GPU 已初始化
+    #[cfg(feature = "gpu")]
+    pub async fn ensure_gpu_init(&mut self) -> Result<()> {
+        if !self.is_gpu_initialized() {
+            tracing::info!("Initializing WGPU now...");
+            self.init_wgpu().await?;
+        }
+        Ok(())
+    }
+
+    #[cfg(not(feature = "gpu"))]
+    pub async fn ensure_gpu_init(&mut self) -> Result<()> {
         Ok(())
     }
 
@@ -396,53 +414,85 @@ impl GpuKernel {
         seq_len: usize,
         kv_len: usize,
     ) -> Result<Vec<f32>> {
-        let mut output = vec![0.0f32; q.len()];
-        
+        #[cfg(feature = "gpu")]
+        {
+            // 如果 GPU 已初始化，尝试使用 GPU
+            if self.is_gpu_initialized() {
+                match self.forward_attention_gpu(q, k, v, self.head_dim, seq_len, kv_len, self.num_heads).await {
+                    Ok(output) => return Ok(output),
+                    Err(e) => {
+                        tracing::warn!("GPU attention failed, falling back to CPU: {}", e);
+                    }
+                }
+            }
+        }
+
+        // CPU fallback - 优化的自注意力实现
         let head_dim = self.head_dim;
         let num_heads = self.num_heads;
         let num_kv_heads = self.num_kv_heads;
-        let kv_per_head = num_heads / num_kv_heads;
-        
+        let kv_per_head = (num_heads / num_kv_heads.max(1)).max(1);
+
+        let scale = (head_dim as f32).sqrt();
+
+        // 更新 KV cache
+        if !k_cache.is_empty() && !v_cache.is_empty() {
+            let cache_offset = seq_len * num_kv_heads * head_dim;
+            if cache_offset < k_cache.len() && cache_offset < v_cache.len() {
+                let copy_size = k.len().min(k_cache.len() - cache_offset);
+                k_cache[cache_offset..cache_offset + copy_size].copy_from_slice(&k[..copy_size]);
+                v_cache[cache_offset..cache_offset + copy_size].copy_from_slice(&v[..copy_size]);
+            }
+        }
+
+        let mut output = vec![0.0f32; q.len()];
+
         for h in 0..num_heads {
             let kv_head = h / kv_per_head;
             let q_offset = h * head_dim;
             let k_offset = kv_head * head_dim;
             let v_offset = kv_head * head_dim;
-            
-            for i in 0..seq_len {
-                let q_start = q_offset + i * head_dim;
-                let mut attn_sum = 0.0f32;
-                let mut output_slice = vec![0.0f32; head_dim];
-                
-                for j in 0..kv_len {
-                    if j > i {
-                        break;
-                    }
-                    
-                    let k_j = j * num_kv_heads * head_dim + k_offset;
-                    let v_j = j * num_kv_heads * head_dim + v_offset;
-                    
+
+            // 收集该 head 的 query 和所有 key/value
+            let q_slice = &q[q_offset..q_offset + head_dim];
+
+            // 计算 attention scores
+            let mut scores = vec![0.0f32; kv_len.min(seq_len)];
+
+            for j in 0..scores.len() {
+                let k_j = k_offset + j * head_dim;
+                if k_j + head_dim <= k.len() {
                     let mut dot = 0.0f32;
                     for d in 0..head_dim {
-                        dot += q[q_start + d] * k[k_j + d];
+                        dot += q_slice[d] * k[k_j + d];
                     }
-                    dot /= (head_dim as f32).sqrt();
-                    
-                    let exp_dot = dot.exp();
-                    attn_sum += exp_dot;
-                    for d in 0..head_dim {
-                        output_slice[d] += exp_dot * v[v_j + d];
-                    }
+                    scores[j] = dot / scale;
                 }
-                
-                if attn_sum > 0.0 {
+            }
+
+            // Softmax
+            let max_score = scores.iter().fold(f32::MIN, |a, &b| a.max(b));
+            let mut exp_sum = 0.0f32;
+            for s in scores.iter_mut() {
+                *s = (*s - max_score).exp();
+                exp_sum += *s;
+            }
+            for s in scores.iter_mut() {
+                *s /= exp_sum.max(1e-8);
+            }
+
+            // 加权求和
+            for j in 0..scores.len() {
+                let v_j = v_offset + j * head_dim;
+                let weight = scores[j];
+                if v_j + head_dim <= v.len() {
                     for d in 0..head_dim {
-                        output[q_start + d] = output_slice[d] / attn_sum;
+                        output[q_offset + d] += weight * v[v_j + d];
                     }
                 }
             }
         }
-        
+
         Ok(output)
     }
 

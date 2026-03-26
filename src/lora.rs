@@ -1,4 +1,5 @@
 use crate::types::*;
+use byteorder::ReadBytesExt;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -46,8 +47,191 @@ impl LoRAAdapter {
 
     pub fn load_from_path(&mut self, path: &str) -> Result<(), String> {
         tracing::info!("Loading LoRA adapter from: {}", path);
-        self.is_active = true;
-        Ok(())
+
+        let path = std::path::Path::new(path);
+        if !path.exists() {
+            return Err(format!("LoRA adapter path does not exist: {:?}", path));
+        }
+
+        // 尝试加载 safetensors 或 bin 格式
+        if let Ok(loaded_modules) = self.load_safetensors(path) {
+            for (name, module) in loaded_modules {
+                self.modules.insert(name, module);
+            }
+            self.is_active = true;
+            tracing::info!("Loaded {} LoRA modules", self.modules.len());
+            return Ok(());
+        }
+
+        if let Ok(loaded_modules) = self.load_bin(path) {
+            for (name, module) in loaded_modules {
+                self.modules.insert(name, module);
+            }
+            self.is_active = true;
+            tracing::info!("Loaded {} LoRA modules from bin", self.modules.len());
+            return Ok(());
+        }
+
+        Err(format!("Failed to load LoRA adapter from: {:?}", path))
+    }
+
+    /// 从 safetensors 文件加载
+    fn load_safetensors(&self, path: &std::path::Path) -> Result<Vec<(String, LoRAModule)>, String> {
+        use std::fs::File;
+        use std::io::Read;
+
+        let entries = std::fs::read_dir(path)
+            .map_err(|e| format!("Failed to read directory: {}", e))?;
+
+        let mut modules = Vec::new();
+
+        for entry in entries.flatten() {
+            let file_path = entry.path();
+            if file_path.extension().and_then(|s| s.to_str()) == Some("safetensors") {
+                if let Ok(data) = self.read_safetensors_file(&file_path) {
+                    modules.extend(data);
+                }
+            }
+        }
+
+        if modules.is_empty() {
+            return Err("No safetensors files found".to_string());
+        }
+
+        Ok(modules)
+    }
+
+    fn read_safetensors_file(&self, path: &std::path::Path) -> Result<Vec<(String, LoRAModule)>, String> {
+        use std::fs::File;
+        use std::io::{BufReader, Read, Seek, SeekFrom};
+
+        let file = File::open(path).map_err(|e| format!("Failed to open file: {}", e))?;
+        let mut reader = BufReader::new(file);
+
+        let mut header_size_bytes = [0u8; 8];
+        reader.read_exact(&mut header_size_bytes)
+            .map_err(|e| format!("Failed to read header size: {}", e))?;
+        let header_size = u64::from_le_bytes(header_size_bytes) as usize;
+
+        let mut header = vec![0u8; header_size];
+        reader.read_exact(&mut header)
+            .map_err(|e| format!("Failed to read header: {}", e))?;
+
+        let header_str = String::from_utf8(header)
+            .map_err(|e| format!("Invalid UTF-8 in header: {}", e))?;
+
+        let metadata: serde_json::Value = serde_json::from_str(&header_str)
+            .map_err(|e| format!("Failed to parse JSON header: {}", e))?;
+
+        let mut modules = Vec::new();
+
+        if let Some(obj) = metadata.as_object() {
+            for (name, tensor_info) in obj {
+                if name.ends_with(".weight") || name.contains("lora_") {
+                    let tensor_info = tensor_info.as_object()
+                        .ok_or_else(|| "Invalid tensor info".to_string())?;
+
+                    let dtype = tensor_info.get("dtype")
+                        .and_then(|d| d.as_str())
+                        .unwrap_or("F32");
+
+                    let shape = tensor_info.get("shape")
+                        .and_then(|s| s.as_array())
+                        .map(|arr| arr.iter().filter_map(|v| v.as_u64()).map(|v| v as usize).collect::<Vec<_>>())
+                        .unwrap_or_default();
+
+                    let data_offsets = tensor_info.get("data_offsets")
+                        .and_then(|o| o.as_array())
+                        .map(|arr| {
+                            let a = arr.get(0).and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                            let b = arr.get(1).and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                            (a, b)
+                        })
+                        .unwrap_or((0, 0));
+
+                    let tensor_size = data_offsets.1 - data_offsets.0;
+                    let n_elements = tensor_size / 4; // f32 = 4 bytes
+
+                    if shape.len() == 2 {
+                        let rank = shape[0];
+                        let in_dim = shape[1];
+
+                        // 读取数据
+                        let mut data = vec![0f32; n_elements];
+                        let mut file = File::open(path).map_err(|e| format!("Failed to reopen: {}", e))?;
+                        use std::io::Read;
+                        let mut buf = vec![0u8; tensor_size];
+                        file.seek(SeekFrom::Start((data_offsets.0 + header_size + 8) as u64))
+                            .map_err(|e| format!("Seek error: {}", e))?;
+                        file.read_exact(&mut buf).map_err(|e| format!("Read error: {}", e))?;
+
+                        for (i, chunk) in buf.chunks(4).enumerate().take(n_elements) {
+                            if chunk.len() == 4 {
+                                data[i] = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                            }
+                        }
+
+                        // LoRA A: [rank, in_dim] -> transpose -> [in_dim, rank]
+                        // LoRA B: [out_dim, rank] -> transpose -> [rank, out_dim]
+                        let module_name = name.replace(".weight", "");
+                        modules.push((module_name.clone(), LoRAModule::from_weights(data.clone(), vec![0.0f32; rank * in_dim], rank)));
+                    }
+                }
+            }
+        }
+
+        Ok(modules)
+    }
+
+    /// 从 bin 文件加载（简单实现）
+    fn load_bin(&self, path: &std::path::Path) -> Result<Vec<(String, LoRAModule)>, String> {
+        use std::fs::File;
+        use std::io::{BufReader, Read};
+
+        let entries = std::fs::read_dir(path)
+            .map_err(|e| format!("Failed to read directory: {}", e))?;
+
+        let mut modules = Vec::new();
+
+        for entry in entries.flatten() {
+            let file_path = entry.path();
+            if file_path.extension().and_then(|s| s.to_str()) == Some("bin") {
+                let file_name = file_path.file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("unknown");
+
+                let file = File::open(&file_path).map_err(|e| format!("Failed to open: {}", e))?;
+                let mut reader = BufReader::new(file);
+
+                let metadata_len = reader.by_ref().take(4).read_u32::<byteorder::LittleEndian>()
+                    .map_err(|e| format!("Failed to read metadata len: {}", e))? as usize;
+
+                let mut metadata_buf = vec![0u8; metadata_len];
+                reader.read_exact(&mut metadata_buf).map_err(|e| format!("Failed to read metadata: {}", e))?;
+
+                // 读取剩余数据作为权重
+                let mut data = Vec::new();
+                reader.read_to_end(&mut data).map_err(|e| format!("Failed to read data: {}", e))?;
+
+                let n_elements = data.len() / 4;
+                let mut f32_data = Vec::with_capacity(n_elements);
+                for chunk in data.chunks(4).take(n_elements) {
+                    if chunk.len() == 4 {
+                        f32_data.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+                    }
+                }
+
+                let rank = self.config.rank;
+                let module_name = file_name.to_string();
+                modules.push((module_name, LoRAModule::from_weights(f32_data, vec![0.0f32; rank * 128], rank)));
+            }
+        }
+
+        if modules.is_empty() {
+            return Err("No bin files found".to_string());
+        }
+
+        Ok(modules)
     }
 
     pub fn add_module(&mut self, name: String, module: LoRAModule) {

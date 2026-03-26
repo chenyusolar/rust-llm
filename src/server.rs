@@ -8,6 +8,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
+use tokio::sync::broadcast;
 
 #[cfg(feature = "server")]
 use axum::{
@@ -26,6 +27,7 @@ use crate::inference::ContinuousBatchingEngine;
 pub struct ServerState {
     pub engine: Arc<RwLock<Option<ContinuousBatchingEngine>>>,
     pub model_loaded: Arc<RwLock<bool>>,
+    pub event_tx: broadcast::Sender<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -55,6 +57,51 @@ pub struct ChatCompletionResponse {
     pub model: String,
     pub choices: Vec<CompletionChoice>,
     pub usage: Usage,
+}
+
+/// 流式聊天补全响应块 (SSE)
+#[derive(Debug, Serialize, Deserialize)]
+#[cfg(feature = "server")]
+pub struct ChatCompletionChunk {
+    pub id: String,
+    pub object: String,
+    pub created: u64,
+    pub model: String,
+    pub choices: Vec<ChunkChoice>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[cfg(feature = "server")]
+pub struct ChunkChoice {
+    pub index: usize,
+    pub delta: DeltaMessage,
+    pub finish_reason: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[cfg(feature = "server")]
+pub struct DeltaMessage {
+    pub role: Option<String>,
+    pub content: Option<String>,
+}
+
+/// 流式文本补全响应块
+#[derive(Debug, Serialize, Deserialize)]
+#[cfg(feature = "server")]
+pub struct CompletionChunk {
+    pub id: String,
+    pub object: String,
+    pub created: u64,
+    pub model: String,
+    pub choices: Vec<TextChunkChoice>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[cfg(feature = "server")]
+pub struct TextChunkChoice {
+    pub index: usize,
+    pub text: String,
+    pub finish_reason: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -143,6 +190,21 @@ pub struct EmbeddingData {
 pub async fn chat_completion(
     State(state): State<ServerState>,
     Json(req): Json<ChatCompletionRequest>,
+) -> Result<Response, StatusCode> {
+    let stream = req.stream.unwrap_or(false);
+
+    if stream {
+        chat_completion_stream(State(state), Json(req)).await
+    } else {
+        let result = chat_completion_non_stream(State(state), Json(req)).await?;
+        Ok(result.into_response())
+    }
+}
+
+#[cfg(feature = "server")]
+async fn chat_completion_non_stream(
+    State(state): State<ServerState>,
+    Json(req): Json<ChatCompletionRequest>,
 ) -> Result<Json<ChatCompletionResponse>, StatusCode> {
     let prompt = req.messages.iter()
         .map(|m| format!("{}: {}", m.role, m.content))
@@ -185,6 +247,111 @@ pub async fn chat_completion(
         }
         Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
     }
+}
+
+#[cfg(feature = "server")]
+async fn chat_completion_stream(
+    State(state): State<ServerState>,
+    Json(req): Json<ChatCompletionRequest>,
+) -> Result<Response, StatusCode> {
+    use futures::StreamExt;
+    use tokio_stream::wrappers::BroadcastStream;
+    use tokio::sync::broadcast;
+
+    let prompt = req.messages.iter()
+        .map(|m| format!("{}: {}", m.role, m.content))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let max_tokens = req.max_tokens.unwrap_or(256);
+    let temperature = req.temperature.unwrap_or(1.0);
+
+    let (tx, _rx) = broadcast::channel::<String>(100);
+    let completion_id = rand_id();
+    let created = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as u64;
+
+    // 克隆 tx 用于发送，rx 用于接收
+    let tx_clone = tx.clone();
+    let completion_id_clone = completion_id.clone();
+    let model_clone = req.model.clone();
+    let created_clone = created;
+
+    // 启动后台任务进行生成
+    tokio::spawn(async move {
+        let mut engine = state.engine.write().await;
+        if let Some(eng) = engine.as_mut() {
+            use futures::StreamExt;
+            use futures::pin_mut;
+            let stream = eng.generate_stream(&prompt, max_tokens, temperature, req.top_p.unwrap_or(0.9)).await;
+            pin_mut!(stream);
+
+            while let Some(result) = stream.next().await {
+                match result {
+                    Ok(token_data) => {
+                        if token_data.is_eos {
+                            // 发送最后的完成事件
+                            let chunk = ChatCompletionChunk {
+                                id: completion_id_clone.clone(),
+                                object: "chat.completion.chunk".to_string(),
+                                created: created_clone,
+                                model: model_clone.clone(),
+                                choices: vec![ChunkChoice {
+                                    index: 0,
+                                    delta: DeltaMessage {
+                                        role: Some("assistant".to_string()),
+                                        content: Some(String::new()),
+                                    },
+                                    finish_reason: Some("stop".to_string()),
+                                }],
+                            };
+                            let _ = tx_clone.send(format!("data: {}\n\n", serde_json::to_string(&chunk).unwrap_or_default()));
+                            break;
+                        }
+
+                        if !token_data.text.is_empty() {
+                            let chunk = ChatCompletionChunk {
+                                id: completion_id_clone.clone(),
+                                object: "chat.completion.chunk".to_string(),
+                                created: created_clone,
+                                model: model_clone.clone(),
+                                choices: vec![ChunkChoice {
+                                    index: 0,
+                                    delta: DeltaMessage {
+                                        role: Some("assistant".to_string()),
+                                        content: Some(token_data.text),
+                                    },
+                                    finish_reason: None,
+                                }],
+                            };
+                            let _ = tx_clone.send(format!("data: {}\n\n", serde_json::to_string(&chunk).unwrap_or_default()));
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!("Stream error: {}", e);
+                        break;
+                    }
+                }
+            }
+        }
+        let _ = tx_clone.send("data: [DONE]\n\n".to_string());
+    });
+
+    // 返回 SSE 流
+    let stream = BroadcastStream::new(state.event_tx.subscribe());
+    let rx_stream = stream.map(|result| {
+        match result {
+            Ok(data) => Ok::<_, std::convert::Infallible>(axum::response::sse::Event::default().data(data)),
+            Err(e) => Ok(axum::response::sse::Event::default().data(format!("error: {}", e))),
+        }
+    });
+
+    let response = axum::response::sse::Sse::new(rx_stream)
+        .keep_alive(axum::response::sse::KeepAlive::default());
+
+    Ok(response.into_response())
 }
 
 #[cfg(feature = "server")]
@@ -307,11 +474,13 @@ pub struct ApiServer {
 #[cfg(feature = "server")]
 impl ApiServer {
     pub fn new(port: u16) -> Self {
+        let (event_tx, _rx) = tokio::sync::broadcast::channel::<String>(100);
         Self {
             port,
             state: ServerState {
                 engine: Arc::new(RwLock::new(None)),
                 model_loaded: Arc::new(RwLock::new(false)),
+                event_tx,
             },
         }
     }

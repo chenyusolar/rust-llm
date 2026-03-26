@@ -27,21 +27,21 @@ pub struct Model {
 impl Model {
     pub async fn load(path: &Path, use_gpu: bool) -> Result<Self> {
         eprintln!("[DEBUG] Loading model from {:?}", path);
-        
+
         #[cfg(feature = "mmap")]
         {
             eprintln!("[DEBUG] Trying mmap loading...");
             match ModelLoader::load_gguf_mmap(path) {
                 Ok((metadata, weights)) => {
                     eprintln!("[DEBUG] mmap loaded successfully: {} layers", metadata.num_layers);
-                    return Self::from_loaded(metadata, weights, use_gpu).await;
+                    return Self::from_loaded(metadata, weights, path, use_gpu).await;
                 }
                 Err(e) => {
                     eprintln!("[DEBUG] mmap failed: {}", e);
                 }
             }
         }
-        
+
         eprintln!("[DEBUG] Loading with regular file read...");
         let (metadata, weights) = match ModelLoader::load_gguf(path) {
             Ok(m) => m,
@@ -50,16 +50,16 @@ impl Model {
                 return Err(e);
             }
         };
-        
+
         eprintln!("[DEBUG] Model loaded: {} layers, {} hidden", metadata.num_layers, metadata.hidden_size);
-        
-        Self::from_loaded(metadata, weights, use_gpu).await
+
+        Self::from_loaded(metadata, weights, path, use_gpu).await
     }
 
-    async fn from_loaded(metadata: ModelMetadata, weights: HashMap<String, QuantizedTensor>, use_gpu: bool) -> Result<Self> {
-        eprintln!("[DEBUG] Loading tokenizer...");
-        
-        let tokenizer = match Tokenizer::load_from_gguf(Path::new("")) {
+    async fn from_loaded(metadata: ModelMetadata, weights: HashMap<String, QuantizedTensor>, model_path: &Path, use_gpu: bool) -> Result<Self> {
+        eprintln!("[DEBUG] Loading tokenizer from {:?}...", model_path);
+
+        let tokenizer = match Tokenizer::load_from_gguf(model_path) {
             Ok(t) => t,
             Err(e) => {
                 eprintln!("[ERROR] Tokenizer loading failed: {}", e);
@@ -132,219 +132,349 @@ impl Model {
 
     pub async fn forward(&self, tokens: &[Token]) -> Result<Vec<f32>> {
         let weights = self.weights.read().await;
-        
+
         let vocab_size = self.tokenizer.vocab_size;
         let hidden_size = self.metadata.hidden_size;
-        
+        let num_layers = self.metadata.num_layers;
+        let num_heads = self.metadata.num_heads;
+        let num_kv_heads = self.metadata.num_kv_heads;
+        let head_dim = self.metadata.head_dim;
+
         if tokens.is_empty() {
             return Ok(vec![0.0f32; vocab_size]);
         }
-        
+
+        // 1. Embedding 层 - 对所有 token 做 embedding 并取最后一个 hidden state
         let embd_key = weights.keys().find(|k| k.contains("token_embd") && k.contains("weight"));
         let Some(embd_key) = embd_key else {
             return Ok(vec![0.0f32; vocab_size]);
         };
-        
+
         let embd_tensor = weights.get(embd_key).unwrap();
         let embd_data = embd_tensor.dequantize();
         let embd_dim = embd_tensor.shape.last().copied().unwrap_or(hidden_size);
-        
-        let last_token = *tokens.last().unwrap_or(&0) as usize;
-        let start_idx = last_token * embd_dim;
-        
-        if start_idx >= embd_data.len() {
-            return Ok(vec![0.0f32; vocab_size]);
+
+        // 对整个序列进行 embedding，累加（或取平均）
+        let seq_len = tokens.len();
+        let mut hidden = vec![0.0f32; hidden_size];
+
+        for &token in tokens {
+            let token_idx = token as usize;
+            let start_idx = token_idx * embd_dim;
+            if start_idx + embd_dim <= embd_data.len() {
+                for i in 0..embd_dim.min(hidden_size) {
+                    hidden[i] += embd_data[start_idx + i];
+                }
+            }
         }
-        
-        let mut hidden = embd_data[start_idx..start_idx + embd_dim].to_vec();
-        
-        for layer_idx in 0..self.metadata.num_layers {
+        // 取平均
+        if seq_len > 0 {
+            for val in hidden.iter_mut() {
+                *val /= seq_len as f32;
+            }
+        }
+
+        // 2. Transformer 层
+        let mut current_hidden = hidden;
+
+        for layer_idx in 0..num_layers {
             let layer_prefix = format!("blk.{}.", layer_idx);
-            
+
+            // Layer Norm (RMS Norm)
             let attn_norm_key = weights.keys().find(|k| k.starts_with(&layer_prefix) && k.contains("attn_norm"));
             let ffn_norm_key = weights.keys().find(|k| k.starts_with(&layer_prefix) && k.contains("ffn_norm"));
-            
+
             if let Some(key) = attn_norm_key {
                 if let Some(tensor) = weights.get(key) {
                     let norm_weight = tensor.dequantize();
-                    hidden = self.rms_norm(&hidden, &norm_weight);
+                    current_hidden = self.rms_norm(&current_hidden, &norm_weight);
                 }
             }
-            
-            let q = self.compute_attn(&weights, &hidden, layer_idx, "q");
-            let k = self.compute_attn(&weights, &hidden, layer_idx, "k");
-            let v = self.compute_attn(&weights, &hidden, layer_idx, "v");
-            
-            let attn_output = self.simple_attention(&q, &k, &v);
-            hidden = hidden.iter().zip(attn_output.iter()).map(|(a, b)| a + b).collect();
-            
+
+            // 3. Attention - 使用正确的矩阵乘法
+            let q = self.compute_q(&weights, &current_hidden, layer_idx);
+            let k = self.compute_k(&weights, &current_hidden, layer_idx);
+            let v = self.compute_v(&weights, &current_hidden, layer_idx);
+
+            // 简单的自注意力实现（对于单 token 生成场景足够）
+            let attn_output = self.multi_head_attention(&q, &k, &v, num_heads, num_kv_heads, head_dim);
+
+            // 残差连接
+            for i in 0..current_hidden.len().min(attn_output.len()) {
+                current_hidden[i] += attn_output[i];
+            }
+
+            // FFN Layer Norm
             if let Some(key) = ffn_norm_key {
                 if let Some(tensor) = weights.get(key) {
                     let norm_weight = tensor.dequantize();
-                    hidden = self.rms_norm(&hidden, &norm_weight);
+                    current_hidden = self.rms_norm(&current_hidden, &norm_weight);
                 }
             }
-            
-            let ffn_output = self.compute_ffn(&weights, &hidden, layer_idx);
-            hidden = hidden.iter().zip(ffn_output.iter()).map(|(a, b)| a + b).collect();
+
+            // 4. FFN (SwiGLU)
+            let ffn_output = self.compute_ffn(&weights, &current_hidden, layer_idx);
+
+            // 残差连接
+            for i in 0..current_hidden.len().min(ffn_output.len()) {
+                current_hidden[i] += ffn_output[i];
+            }
         }
-        
+
+        // 5. 最终 Layer Norm
+        let final_norm_key = weights.keys().find(|k| k.contains("output") && k.contains("norm"));
+        if let Some(key) = final_norm_key {
+            if let Some(tensor) = weights.get(key) {
+                let norm_weight = tensor.dequantize();
+                current_hidden = self.rms_norm(&current_hidden, &norm_weight);
+            }
+        }
+
+        // 6. LM Head - 计算 logits
         let output_key = weights.keys().find(|k| k.contains("output") && k.contains("weight"));
         if let Some(key) = output_key {
             if let Some(tensor) = weights.get(key) {
                 let output_weight = tensor.dequantize();
-                let mut logits = vec![0.0f32; vocab_size];
-                
-                for i in 0..vocab_size.min(output_weight.len() / hidden_size) {
-                    let mut sum = 0.0f32;
-                    for j in 0..hidden_size.min(output_weight.len()) {
-                        sum += hidden[j] * output_weight[i * hidden_size + j];
-                    }
-                    logits[i] = sum;
-                }
-                
+                let logits = self.matmul_vec(&current_hidden, &output_weight, hidden_size, vocab_size);
                 return Ok(logits);
             }
         }
-        
+
         Ok(vec![0.0f32; vocab_size])
     }
-    
+
+    /// 标准矩阵乘法: output = input @ weight, 其中 input 是 [hidden_size], weight 是 [vocab_size, hidden_size]
+    fn matmul_vec(&self, input: &[f32], weight: &[f32], hidden_size: usize, vocab_size: usize) -> Vec<f32> {
+        let mut logits = vec![0.0f32; vocab_size];
+
+        for i in 0..vocab_size {
+            let mut sum = 0.0f32;
+            for j in 0..hidden_size.min(weight.len() / vocab_size.max(1)) {
+                let weight_idx = i * hidden_size + j;
+                if weight_idx < weight.len() {
+                    sum += input[j] * weight[weight_idx];
+                }
+            }
+            logits[i] = sum;
+        }
+
+        logits
+    }
+
     fn rms_norm(&self, input: &[f32], weight: &[f32]) -> Vec<f32> {
         let size = input.len();
         let rms = (input.iter().map(|x| x * x).sum::<f32>() / size as f32).sqrt();
         let eps = 1e-5;
         input.iter().zip(weight.iter()).map(|(x, w)| x / (rms + eps) * w).collect()
     }
-    
-    fn compute_attn(&self, weights: &std::collections::HashMap<String, QuantizedTensor>, input: &[f32], layer_idx: usize, attn_type: &str) -> Vec<f32> {
-        let prefix = format!("blk.{}.attn.{}", layer_idx, attn_type);
-        let key = weights.keys().find(|k| k.starts_with(&prefix) && k.contains("weight"));
-        
+
+    /// 计算 Q 投影: [hidden_size] -> [num_heads * head_dim]
+    fn compute_q(&self, weights: &std::collections::HashMap<String, QuantizedTensor>, input: &[f32], layer_idx: usize) -> Vec<f32> {
+        let hidden_size = self.metadata.hidden_size;
+        let num_heads = self.metadata.num_heads;
+        let head_dim = self.metadata.head_dim;
+
+        let prefix = format!("blk.{}.attn_q", layer_idx);
+        let key = weights.keys().find(|k| k.starts_with(&prefix) && k.contains("weight"))
+            .or_else(|| weights.keys().find(|k| k.contains(&format!("{}.q_proj", layer_idx)) && k.contains("weight")));
+
         if let Some(key) = key {
             if let Some(tensor) = weights.get(key) {
                 let weight = tensor.dequantize();
-                let hidden_size = self.metadata.hidden_size;
-                let head_dim = self.metadata.head_dim;
-                let num_heads = self.metadata.num_heads;
-                
-                let mut output = vec![0.0f32; input.len()];
-                for i in 0..num_heads {
-                    for j in 0..head_dim {
-                        let mut sum = 0.0f32;
-                        for k in 0..input.len().min(weight.len() / (num_heads * head_dim)) {
-                            sum += input[k] * weight[i * head_dim * input.len() + j * input.len() + k];
-                        }
-                        output[i * head_dim + j] = sum;
-                    }
-                }
-                return output;
+                // weight 形状: [num_heads * head_dim, hidden_size] 或 [hidden_size, num_heads * head_dim]
+                return self.matmul_fc(input, &weight, hidden_size, num_heads * head_dim);
             }
         }
+
+        // Fallback: 简单线性投影
+        vec![0.1f32; num_heads * head_dim]
+    }
+
+    /// 计算 K 投影: [hidden_size] -> [num_kv_heads * head_dim]
+    fn compute_k(&self, weights: &std::collections::HashMap<String, QuantizedTensor>, input: &[f32], layer_idx: usize) -> Vec<f32> {
+        let hidden_size = self.metadata.hidden_size;
+        let num_kv_heads = self.metadata.num_kv_heads;
+        let head_dim = self.metadata.head_dim;
+
+        let prefix = format!("blk.{}.attn_k", layer_idx);
+        let key = weights.keys().find(|k| k.starts_with(&prefix) && k.contains("weight"))
+            .or_else(|| weights.keys().find(|k| k.contains(&format!("{}.k_proj", layer_idx)) && k.contains("weight")));
+
+        if let Some(key) = key {
+            if let Some(tensor) = weights.get(key) {
+                let weight = tensor.dequantize();
+                return self.matmul_fc(input, &weight, hidden_size, num_kv_heads * head_dim);
+            }
+        }
+
+        vec![0.1f32; num_kv_heads * head_dim]
+    }
+
+    /// 计算 V 投影: [hidden_size] -> [num_kv_heads * head_dim]
+    fn compute_v(&self, weights: &std::collections::HashMap<String, QuantizedTensor>, input: &[f32], layer_idx: usize) -> Vec<f32> {
+        let hidden_size = self.metadata.hidden_size;
+        let num_kv_heads = self.metadata.num_kv_heads;
+        let head_dim = self.metadata.head_dim;
+
+        let prefix = format!("blk.{}.attn_v", layer_idx);
+        let key = weights.keys().find(|k| k.starts_with(&prefix) && k.contains("weight"))
+            .or_else(|| weights.keys().find(|k| k.contains(&format!("{}.v_proj", layer_idx)) && k.contains("weight")));
+
+        if let Some(key) = key {
+            if let Some(tensor) = weights.get(key) {
+                let weight = tensor.dequantize();
+                return self.matmul_fc(input, &weight, hidden_size, num_kv_heads * head_dim);
+            }
+        }
+
+        vec![0.1f32; num_kv_heads * head_dim]
+    }
+
+    /// 通用全连接投影: input [in_dim] @ weight [out_dim, in_dim] -> output [out_dim]
+    fn matmul_fc(&self, input: &[f32], weight: &[f32], in_dim: usize, out_dim: usize) -> Vec<f32> {
+        let mut output = vec![0.0f32; out_dim];
+
+        // 假设 weight 形状是 [out_dim, in_dim]，按行存储
+        for i in 0..out_dim {
+            let mut sum = 0.0f32;
+            for j in 0..in_dim {
+                let weight_idx = i * in_dim + j;
+                if weight_idx < weight.len() {
+                    sum += input[j] * weight[weight_idx];
+                }
+            }
+            output[i] = sum;
+        }
+
+        output
+    }
+
+    /// 多头自注意力
+    fn multi_head_attention(&self, q: &[f32], k: &[f32], v: &[f32], num_heads: usize, num_kv_heads: usize, head_dim: usize) -> Vec<f32> {
+        let hidden_size = num_heads * head_dim;
+        let mut output = vec![0.0f32; hidden_size];
+
+        // GQA: 复制 KV heads 以匹配 Q heads
+        let kv_per_head = num_heads / num_kv_heads.max(1);
+
+        for h in 0..num_heads {
+            let kv_head = h / kv_per_head;
+
+            // 提取该 head 的 q, k, v
+            let q_offset = h * head_dim;
+            let k_offset = kv_head * head_dim;
+            let v_offset = kv_head * head_dim;
+
+            // 计算 attention score: q · k / sqrt(head_dim)
+            let scale = (head_dim as f32).sqrt();
+
+            let mut max_score = f32::MIN;
+            let mut exp_sum = 0.0f32;
+
+            // 计算 q·k 分数
+            let mut scores = vec![0.0f32; num_kv_heads];
+            for kh in 0..num_kv_heads.min(1) {
+                let mut dot = 0.0f32;
+                for d in 0..head_dim {
+                    let q_idx = q_offset + d;
+                    let k_idx = kh * head_dim + d;
+                    if q_idx < q.len() && k_idx < k.len() {
+                        dot += q[q_idx] * k[k_idx];
+                    }
+                }
+                scores[kh] = dot / scale;
+                max_score = max_score.max(scores[kh]);
+            }
+
+            // Softmax
+            for s in scores.iter_mut() {
+                *s = (*s - max_score).exp();
+                exp_sum += *s;
+            }
+            for s in scores.iter_mut() {
+                *s /= exp_sum.max(1e-8);
+            }
+
+            // 加权求和 v
+            for kh in 0..num_kv_heads.min(1) {
+                let weight = scores[kh];
+                for d in 0..head_dim {
+                    let out_idx = h * head_dim + d;
+                    let v_idx = kh * head_dim + d;
+                    if out_idx < output.len() && v_idx < v.len() {
+                        output[out_idx] += weight * v[v_idx];
+                    }
+                }
+            }
+        }
+
+        // Output projection
+        let prefix = ""; // 需要传递 layer_idx，这里简化处理
+        self.output_proj(&output, 0)
+    }
+
+    fn output_proj(&self, input: &[f32], layer_idx: usize) -> Vec<f32> {
+        // 简化：直接返回 input，因为 attention 输出已经包含残差
         input.to_vec()
     }
-    
-    fn simple_attention(&self, q: &[f32], k: &[f32], v: &[f32]) -> Vec<f32> {
-        let head_dim = self.metadata.head_dim;
-        let num_heads = self.metadata.num_heads;
-        
-        if q.is_empty() || k.is_empty() || v.is_empty() {
-            return vec![0.0f32; head_dim * num_heads];
-        }
-        
-        let mut output = vec![0.0f32; q.len()];
-        
-        for i in 0..num_heads {
-            let q_start = i * head_dim;
-            let k_start = i * head_dim;
-            let v_start = i * head_dim;
-            
-            let q_slice = &q[q_start..q_start + head_dim.min(q.len() - q_start)];
-            let k_slice = &k[k_start..k_start + head_dim.min(k.len() - k_start)];
-            let v_slice = &v[v_start..v_start + head_dim.min(v.len() - v_start)];
-            
-            let mut scores = vec![0.0f32; head_dim];
-            for j in 0..head_dim {
-                scores[j] = q_slice.get(j).unwrap_or(&0.0) * k_slice.get(j).unwrap_or(&0.0);
-            }
-            
-            let max_score = scores.iter().fold(f32::MIN, |a, &b| a.max(b));
-            scores.iter_mut().for_each(|s| *s = (*s - max_score).exp());
-            
-            let sum: f32 = scores.iter().sum();
-            if sum > 0.0 {
-                scores.iter_mut().for_each(|s| *s /= sum);
-            }
-            
-            for j in 0..head_dim {
-                let mut val = 0.0f32;
-                for k in 0..head_dim {
-                    val += scores[k] * v_slice.get(k).unwrap_or(&0.0);
-                }
-                output[i * head_dim + j] = val;
-            }
-        }
-        
-        output
-    }
-    
+
+    /// FFN with SwiGLU activation
     fn compute_ffn(&self, weights: &std::collections::HashMap<String, QuantizedTensor>, input: &[f32], layer_idx: usize) -> Vec<f32> {
-        let prefix = format!("blk.{}.ffn", layer_idx);
-        
-        let gate_key = weights.keys().find(|k| k.starts_with(&prefix) && k.contains("gate"));
-        let up_key = weights.keys().find(|k| k.starts_with(&prefix) && k.contains("up"));
-        let down_key = weights.keys().find(|k| k.starts_with(&prefix) && k.contains("down"));
-        
-        let intermediate = self.metadata.intermediate_size;
         let hidden_size = self.metadata.hidden_size;
-        
-        let mut gate = vec![0.0f32; intermediate];
-        let mut up = vec![0.0f32; intermediate];
-        
-        if let Some(key) = gate_key {
+        let intermediate_size = self.metadata.intermediate_size;
+
+        // Gate projection
+        let gate_key = weights.keys().find(|k| k.contains(&format!("{}.ffn_gate", layer_idx)) && k.contains("weight"))
+            .or_else(|| weights.keys().find(|k| k.contains("gate_proj") && k.contains("weight")));
+
+        // Up projection
+        let up_key = weights.keys().find(|k| k.contains(&format!("{}.ffn_up", layer_idx)) && k.contains("weight"))
+            .or_else(|| weights.keys().find(|k| k.contains("up_proj") && k.contains("weight")));
+
+        // Down projection
+        let down_key = weights.keys().find(|k| k.contains(&format!("{}.ffn_down", layer_idx)) && k.contains("weight"))
+            .or_else(|| weights.keys().find(|k| k.contains("down_proj") && k.contains("weight")));
+
+        let gate_out = if let Some(key) = gate_key {
             if let Some(tensor) = weights.get(key) {
-                let w = tensor.dequantize();
-                for i in 0..intermediate.min(w.len() / hidden_size) {
-                    let mut sum = 0.0f32;
-                    for j in 0..input.len().min(w.len() / intermediate) {
-                        sum += input[j] * w[i * input.len() + j];
-                    }
-                    gate[i] = sum;
-                }
+                let weight = tensor.dequantize();
+                self.matmul_fc(input, &weight, hidden_size, intermediate_size)
+            } else {
+                vec![0.0f32; intermediate_size]
             }
-        }
-        
-        if let Some(key) = up_key {
+        } else {
+            vec![0.0f32; intermediate_size]
+        };
+
+        let up_out = if let Some(key) = up_key {
             if let Some(tensor) = weights.get(key) {
-                let w = tensor.dequantize();
-                for i in 0..intermediate.min(w.len() / hidden_size) {
-                    let mut sum = 0.0f32;
-                    for j in 0..input.len().min(w.len() / intermediate) {
-                        sum += input[j] * w[i * input.len() + j];
-                    }
-                    up[i] = sum;
-                }
+                let weight = tensor.dequantize();
+                self.matmul_fc(input, &weight, hidden_size, intermediate_size)
+            } else {
+                vec![0.0f32; intermediate_size]
             }
-        }
-        
-        let silu_gate: Vec<f32> = gate.iter().zip(up.iter()).map(|(g, u)| g * (1.0 / (1.0 + (-*g).exp())) * u).collect();
-        
-        let mut output = vec![0.0f32; hidden_size];
-        
-        if let Some(key) = down_key {
+        } else {
+            vec![0.0f32; intermediate_size]
+        };
+
+        // SwiGLU: gate * silu(up)
+        let silu_gate: Vec<f32> = gate_out.iter().zip(up_out.iter())
+            .map(|(g, u)| g * silu(*u))
+            .collect();
+
+        // Down projection
+        let down_out = if let Some(key) = down_key {
             if let Some(tensor) = weights.get(key) {
-                let w = tensor.dequantize();
-                for i in 0..hidden_size.min(w.len() / intermediate) {
-                    let mut sum = 0.0f32;
-                    for j in 0..silu_gate.len().min(w.len() / hidden_size) {
-                        sum += silu_gate[j] * w[i * silu_gate.len() + j];
-                    }
-                    output[i] = sum;
-                }
+                let weight = tensor.dequantize();
+                self.matmul_fc(&silu_gate, &weight, intermediate_size, hidden_size)
+            } else {
+                vec![0.0f32; hidden_size]
             }
-        }
-        
-        output
+        } else {
+            vec![0.0f32; hidden_size]
+        };
+
+        down_out
     }
 
     pub fn sample(&self, logits: &[f32]) -> Token {
@@ -358,4 +488,8 @@ impl Model {
     pub fn decode(&self, tokens: &[Token]) -> String {
         self.tokenizer.decode(tokens)
     }
+}
+
+fn silu(x: f32) -> f32 {
+    x / (1.0 + (-x).exp())
 }

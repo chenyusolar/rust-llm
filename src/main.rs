@@ -409,9 +409,12 @@ async fn run_server(
         100,
     );
 
+    let (event_tx, _rx) = tokio::sync::broadcast::channel::<String>(100);
+
     let state = ServerState {
         engine: Arc::new(RwLock::new(Some(engine))),
         model_loaded: Arc::new(RwLock::new(true)),
+        event_tx,
     };
 
     println!("[INFO] Starting API server on http://{}:{}", host, port);

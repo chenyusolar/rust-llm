@@ -1066,85 +1066,168 @@ impl ModelLoader {
         let mut file = File::open(path)?;
         let file_size = file.seek(SeekFrom::End(0))?;
 
+        // Read and verify GGUF header
         file.seek(SeekFrom::Start(0))?;
-        let mut header = [0u8; 4];
-        file.read_exact(&mut header)?;
-
-        let magic = u32::from_le_bytes(header);
+        let mut magic_bytes = [0u8; 4];
+        file.read_exact(&mut magic_bytes)?;
+        let magic = u32::from_le_bytes(magic_bytes);
         if magic != 0x46554747 {
             return Err(anyhow!("Not a GGUF file"));
         }
 
-        // Try standard GGUF footer first
-        let (tensor_count, metadata_count, tensor_info_start) =
-            match Self::read_gguf_footer(&mut file, file_size) {
-                Ok((tc, mc, _)) => (tc, mc as usize, 0u64),
-                Err(e) => {
-                    eprintln!(
-                        "[WARN] Standard GGUF footer not found: {}, using heuristic",
-                        e
-                    );
-                    // For unusual files, estimate
-                    (106usize, 50usize, 11_000_000u64) // Fallback values
-                }
-            };
+        // Read version
+        let mut version_bytes = [0u8; 4];
+        file.read_exact(&mut version_bytes)?;
+        let version = u32::from_le_bytes(version_bytes);
+        eprintln!("[DEBUG] GGUF version: {}", version);
 
-        // Parse metadata - try to skip past it to get to tensor info
-        file.seek(SeekFrom::Start(8))?;
+        // Read tensor_count from header
+        let mut tc_bytes = [0u8; 4];
+        file.read_exact(&mut tc_bytes)?;
+        let tensor_count = u32::from_le_bytes(tc_bytes) as usize;
+        eprintln!("[DEBUG] Tensor count from header: {}", tensor_count);
+
+        // Read metadata_count from header
+        let mut mc_bytes = [0u8; 4];
+        file.read_exact(&mut mc_bytes)?;
+        let metadata_count = u32::from_le_bytes(mc_bytes) as usize;
+        eprintln!("[DEBUG] Metadata count from header: {}", metadata_count);
+
+        // Parse metadata
+        eprintln!("[DEBUG] Parsing {} metadata entries...", metadata_count);
         let mut metadata = HashMap::new();
+        let mut metadata_end_pos = 16u64; // After header
 
-        // Try reading metadata entries
-        for _ in 0..metadata_count {
+        for i in 0..metadata_count {
+            let pos = file.stream_position().unwrap_or(0);
             let key = match read_string_gguf(&mut file) {
                 Ok(k) => k,
-                Err(_) => break,
+                Err(e) => {
+                    eprintln!("[DEBUG] Metadata entry {}: key read error at pos {}: {}", i, pos, e);
+                    break;
+                }
             };
             if key.is_empty() {
+                eprintln!("[DEBUG] Metadata entry {}: empty key at pos {}, breaking", i, pos);
                 break;
             }
             let value_type = match read_u32(&mut file) {
                 Ok(vt) => vt,
-                Err(_) => break,
+                Err(e) => {
+                    eprintln!("[DEBUG] Metadata entry {}: value_type read error: {}", i, e);
+                    break;
+                }
             };
 
             match value_type {
-                0 => {
-                    let _ = read_u32(&mut file);
+                0 => { let _ = read_u32(&mut file); }
+                1 => { let _ = read_u64(&mut file); }
+                2 => { let _ = read_f32(&mut file); }
+                3 => { let _ = file.read_exact(&mut [0u8; 1]); }
+                4 => { let _ = read_string_gguf(&mut file); }
+                5 => { let _ = skip_array_gguf(&mut file); }
+                _ => {
+                    eprintln!("[DEBUG] Metadata entry {}: unknown value_type {} at pos {}, breaking", i, value_type, pos);
+                    break;
                 }
-                1 => {
-                    let _ = read_u64(&mut file);
-                }
-                2 => {
-                    let _ = read_f32(&mut file);
-                }
-                3 => {
-                    let _ = file.read_exact(&mut [0u8; 1]);
-                }
-                4 => {
-                    let _ = read_string_gguf(&mut file);
-                }
-                5 => {
-                    let _ = skip_array_gguf(&mut file);
-                }
-                _ => break,
             }
             metadata.insert(key, value_type.to_string());
         }
 
-        // Now we're positioned after metadata, read tensor info
-        let alignment = read_u32(&mut file).unwrap_or(32);
+        eprintln!("[DEBUG] Metadata parsed, {} entries, starting tensor info at byte {}", metadata.len(), file.stream_position().unwrap_or(16));
+
+        // Read alignment after metadata
+        let alignment_pos = file.stream_position().unwrap_or(0);
+        let alignment = read_u32(&mut file).unwrap_or(32) as usize;
+        let pos_after_alignment = file.stream_position().unwrap_or(0);
+        eprintln!("[DEBUG] Alignment: {} at pos {}, now at {}", alignment, alignment_pos, pos_after_alignment);
+
+        // GGUF alignment is typically 32 bytes - tensor data must be aligned
+        // But tensor INFO starts right after alignment field
+        let tensor_info_start = pos_after_alignment as usize;
+
+        // The alignment field itself should be 4 bytes, so we're at byte 20
+        // But the actual tensor data starts at an aligned boundary
+        // Let's calculate where tensor data would start based on file size and estimates
+        let estimated_tensor_data_start = ((tensor_info_start + 20000 + alignment - 1) / alignment) * alignment;
+        eprintln!("[DEBUG] Tensor info starts at {}, estimated tensor data start (aligned): {}", tensor_info_start, estimated_tensor_data_start);
+
+        // Read bytes at both positions to understand the layout
+        file.seek(SeekFrom::Start(tensor_info_start as u64))?;
+        let mut debug_bytes1 = [0u8; 32];
+        if let Ok(_) = file.read_exact(&mut debug_bytes1) {
+            eprintln!("[DEBUG] Bytes at tensor_info_start ({}): {:02X?}", tensor_info_start, debug_bytes1);
+        }
+
+        file.seek(SeekFrom::Start(estimated_tensor_data_start as u64))?;
+        let mut debug_bytes2 = [0u8; 32];
+        if let Ok(_) = file.read_exact(&mut debug_bytes2) {
+            eprintln!("[DEBUG] Bytes at estimated tensor_data_start ({}): {:02X?}", estimated_tensor_data_start, debug_bytes2);
+        }
+
+        // Seek back to tensor_info_start to start parsing
+        file.seek(SeekFrom::Start(tensor_info_start as u64))?;
 
         let mut tensors_info = Vec::new();
 
+        eprintln!("[DEBUG] Starting to read {} tensors...", tensor_count);
         for i in 0..tensor_count {
-            let name = match read_string_gguf(&mut file) {
-                Ok(n) => n,
-                Err(_) => break,
+            if i % 50 == 0 || i < 3 {
+                eprintln!("[DEBUG] Reading tensor {}/{} at pos {}", i, tensor_count, file.stream_position().unwrap_or(0));
+            }
+
+            // Debug peek at bytes
+            let pos_before = file.stream_position().unwrap_or(0);
+            let mut peek_bytes = [0u8; 24];
+            if let Ok(_) = file.read_exact(&mut peek_bytes) {
+                file.seek(SeekFrom::Start(pos_before))?;
+                if i < 3 {
+                    eprintln!("[DEBUG] Tensor {} bytes at pos {}: {:02X?}", i, pos_before, peek_bytes);
+                }
+            }
+
+            // GGUF tensor info format:
+            // - name_len: uint32 (4 bytes)
+            // - name: name_len bytes
+            // - n_dims: uint32 (4 bytes)
+            // - dimensions: n_dims * uint64
+            // - dtype: uint32 (4 bytes)
+            // - offset: uint64 (8 bytes)
+            let name_len = match read_u32(&mut file) {
+                Ok(n) => n as usize,
+                Err(e) => {
+                    eprintln!("[DEBUG] Tensor {}: failed to read name_len at pos {}: {}", i, file.stream_position().unwrap_or(0), e);
+                    break;
+                }
             };
+            if i < 3 {
+                eprintln!("[DEBUG] Tensor {} name_len={}", i, name_len);
+            }
+            if name_len > 1000 || name_len == 0 {
+                eprintln!("[DEBUG] ERROR: invalid name_len {} at pos {}, stopping", name_len, pos_before);
+                break;
+            }
+
+            let mut name_bytes = vec![0u8; name_len];
+            if let Err(e) = file.read_exact(&mut name_bytes) {
+                eprintln!("[DEBUG] Tensor {}: failed to read name bytes: {}", i, e);
+                break;
+            }
+            let name = String::from_utf8_lossy(&name_bytes).to_string();
+            if i < 3 {
+                eprintln!("[DEBUG] Tensor {} name='{}'", i, name);
+            }
+
             let n_dims = match read_u32(&mut file) {
                 Ok(d) => d as usize,
-                Err(_) => break,
+                Err(e) => {
+                    eprintln!("[DEBUG] Tensor {} n_dims read error: {}", i, e);
+                    break;
+                }
             };
+            if i < 3 {
+                eprintln!("[DEBUG] Tensor {} n_dims={}", i, n_dims);
+            }
             let mut shape = Vec::new();
             for _ in 0..n_dims {
                 if let Ok(d) = read_u64(&mut file) {
@@ -1154,6 +1237,10 @@ impl ModelLoader {
             let dtype = read_u32(&mut file).unwrap_or(0);
             let offset = read_u64(&mut file).unwrap_or(0) as usize;
 
+            if i < 3 {
+                eprintln!("[DEBUG] Tensor {}: name='{}', shape={:?}, dtype={}, offset={}",
+                    i, name, shape, dtype, offset);
+            }
             tensors_info.push((name.clone(), shape.clone(), dtype, offset));
         }
 
@@ -1220,29 +1307,43 @@ impl ModelLoader {
 
         let model_metadata = parse_model_metadata(&metadata);
 
+        eprintln!("[DEBUG] GGUF load complete: {} tensors, metadata: hidden_size={}, num_layers={}",
+            tensors.len(), model_metadata.hidden_size, model_metadata.num_layers);
+
         Ok((model_metadata, tensors))
     }
 
     fn read_gguf_footer(file: &mut File, file_size: u64) -> Result<(usize, usize, u64)> {
-        // Standard GGUF: tensor_count at -12, metadata_count at -8
-        file.seek(SeekFrom::End(-12))?;
+        // Standard GGUF footer format (from llama.cpp):
+        // At file_size - 12: tensor_count (u32)
+        // At file_size - 8: metadata_count (u32)
+        // At file_size - 4: alignment (u32)
+        let footer_pos = file.seek(SeekFrom::End(-12))?;
+        eprintln!("[DEBUG] Footer position: {} (file_size-12: {})", footer_pos, file_size - 12);
 
         let mut tc_bytes = [0u8; 4];
         file.read_exact(&mut tc_bytes)?;
         let tensor_count = u32::from_le_bytes(tc_bytes) as usize;
+        eprintln!("[DEBUG] Raw tensor_count bytes: {:?} -> {}", tc_bytes, tensor_count);
 
-        let mut mc_bytes = [0u8; 8];
+        let mut mc_bytes = [0u8; 4];
         file.read_exact(&mut mc_bytes)?;
-        let metadata_count = u64::from_le_bytes(mc_bytes) as usize;
+        let metadata_count = u32::from_le_bytes(mc_bytes) as usize;
+        eprintln!("[DEBUG] Raw metadata_count bytes: {:?} -> {}", mc_bytes, metadata_count);
 
-        if metadata_count > 10000 || tensor_count > 10000 {
+        let mut align_bytes = [0u8; 4];
+        file.read_exact(&mut align_bytes)?;
+        let alignment = u32::from_le_bytes(align_bytes) as usize;
+        eprintln!("[DEBUG] Alignment bytes: {:?} -> {}", align_bytes, alignment);
+
+        // Sanity check - tensor count should be reasonable (1 to 10000 for most models)
+        if tensor_count == 0 || tensor_count > 10000 {
+            eprintln!("[WARN] Invalid tensor_count {} - file may be non-standard GGUF", tensor_count);
             return Err(anyhow!("Invalid GGUF counts"));
         }
 
-        // Calculate where tensor info starts
-        // After reading metadata, we need to find the tensor info position
-        // For now, use standard calculation
-        let tensor_info_start = file_size - 12 - (tensor_count as u64 * 100); // Rough estimate
+        // Calculate where tensor info starts (rough estimate)
+        let tensor_info_start = 16u64; // Start right after header
 
         Ok((tensor_count, metadata_count, tensor_info_start))
     }

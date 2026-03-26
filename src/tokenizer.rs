@@ -6,6 +6,7 @@ use std::path::Path;
 use crate::types::*;
 use anyhow::{anyhow, Result};
 
+#[derive(Clone)]
 pub struct Tokenizer {
     vocab: HashMap<String, Token>,
     id_to_token: Vec<String>,
